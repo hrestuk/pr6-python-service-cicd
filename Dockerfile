@@ -5,7 +5,10 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-RUN groupadd --system appgroup \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps iproute2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system appgroup \
     && useradd --system --gid appgroup \
        --home-dir /app --no-create-home \
        --shell /usr/sbin/nologin appuser
