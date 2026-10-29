@@ -2,7 +2,7 @@ services:
   app:
     build:
       context: .
-    image: pr6-python-service:local
+    image: pr6-python-service:${IMAGE_TAG:-local}
     container_name: pr6-app
     ports:
       - "5000:5000"
