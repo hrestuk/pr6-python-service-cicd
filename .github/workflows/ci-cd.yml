@@ -3,11 +3,16 @@ name: PR6 CI/CD
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main]
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      simulate_health_failure:
+        description: "Simulate /health failure to test rollback"
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -26,7 +31,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install test dependencies
         run: |
           mkdir -p reports
           python -m pip install --upgrade pip
@@ -77,23 +82,20 @@ jobs:
             .
 
       - name: Start container
-        run: |
-          docker compose up -d --no-build
+        run: docker compose up -d --no-build
 
-      - name: Wait for HTTP health check
+      - name: Wait for health endpoint
         run: |
           for attempt in $(seq 1 30); do
             if curl --fail --silent --max-time 2 \
               http://127.0.0.1:5000/health; then
               echo
-              echo "Health check passed."
               exit 0
             fi
             sleep 2
           done
-
-          echo "Service did not become healthy in 60 seconds." >&2
           docker compose ps
+          docker compose logs --no-color
           exit 1
 
       - name: Verify HTTP endpoints
@@ -112,10 +114,9 @@ jobs:
           assert health == {"status": "ok"}, health
 
           version = get_json("http://127.0.0.1:5000/version")
-          expected = {"version": os.environ["APP_VERSION"]}
-          assert version == expected, version
+          assert version == {"version": os.environ["APP_VERSION"]}, version
 
-          print("HTTP health and version checks passed.")
+          print("HTTP checks passed.")
           PY
 
       - name: Run Testinfra
@@ -126,7 +127,11 @@ jobs:
             --junitxml=reports/testinfra.xml
 
       - name: Export image for deployment
-        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: >-
+          success() &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' ||
+           github.event_name == 'workflow_dispatch')
         run: |
           docker save "pr6-python-service:${GITHUB_SHA}" \
             -o reports/pr6-image.tar
@@ -134,12 +139,11 @@ jobs:
       - name: Collect container diagnostics
         if: always()
         run: |
-          mkdir -p reports
           docker compose ps --all > reports/compose-ps.txt 2>&1 || true
           docker compose logs --no-color > reports/container.log 2>&1 || true
           docker inspect pr6-app > reports/container-inspect.json 2>&1 || true
 
-      - name: Upload container reports and image
+      - name: Upload reports and image
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -148,6 +152,125 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Stop container
+      - name: Stop CI container
         if: always()
         run: docker compose down --volumes --remove-orphans || true
+
+  deploy:
+    name: Deploy to Ubuntu VM
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
+    needs: [unit-tests, container-checks]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      VM_HOST: "100.70.46.82"
+      VM_USER: "pr6user"
+      REMOTE_DIR: "/home/pr6user/pr6-deploy"
+      SIMULATE_HEALTH_FAILURE: ${{ inputs.simulate_health_failure && 'true' || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download verified image artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: container-checks-${{ github.sha }}
+          path: reports
+
+      - name: Check image artifact
+        run: test -s reports/pr6-image.tar
+
+      - name: Connect to Tailscale
+        id: tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: latest
+
+      - name: Configure SSH key
+        id: ssh
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -eu
+          test -n "$DEPLOY_SSH_KEY"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' \
+            > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -H "$VM_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Verify SSH and Docker access
+        run: |
+          ssh -i "$HOME/.ssh/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
+            'id -un && docker info >/dev/null && echo "SSH and Docker access OK"'
+
+      - name: Copy image and deployment files
+        run: |
+          ssh -i "$HOME/.ssh/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
+            "mkdir -p '$REMOTE_DIR'"
+
+          scp -i "$HOME/.ssh/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            reports/pr6-image.tar compose.deploy.yaml scripts/deploy.sh \
+            "$VM_USER@$VM_HOST:$REMOTE_DIR/"
+
+      - name: Deploy and verify health
+        run: |
+          ssh -i "$HOME/.ssh/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
+            "bash '$REMOTE_DIR/deploy.sh' '$GITHUB_SHA' '$SIMULATE_HEALTH_FAILURE'"
+
+      - name: Collect VM diagnostics
+        if: always() && steps.tailscale.outcome == 'success' && steps.ssh.outcome == 'success'
+        run: |
+          mkdir -p deployment-reports
+          ssh -i "$HOME/.ssh/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
+            'docker ps -a --filter name=pr6-app; docker logs pr6-app 2>&1 || true' \
+            > deployment-reports/vm-container.log 2>&1 || true
+
+          ssh -i "$HOME/.ssh/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
+            'curl --silent --show-error --max-time 3 -i http://127.0.0.1:5000/health || true' \
+            > deployment-reports/vm-health.txt 2>&1 || true
+
+      - name: Upload VM diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-diagnostics-${{ github.sha }}
+          path: deployment-reports/
+          if-no-files-found: warn
+          retention-days: 14
